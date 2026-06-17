@@ -27,4 +27,4 @@ Since everything lives in your browser's local storage, your data is tied to *th
 
 ## Credit
 
-Created by Dan Sprockett · 2026, with a lot of help from Claude. Fork it, poke at it, make it yours.
+Created by Dan Sprockett · 2026
