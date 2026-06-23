@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Golden Hour (Offline)</title>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
 @font-face{
   font-family:'Quicksand';
@@ -59,7 +60,7 @@ input,select,textarea{font-family:var(--font-sans);}
 /* header */
 .top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;border-bottom:1px solid var(--rule);padding-bottom:18px;margin-bottom:22px;}
 .title-block h1{font-family:'Anton',sans-serif;font-style:normal;font-weight:400;text-transform:uppercase;font-size:84px;margin:0 0 6px;letter-spacing:0.5px;color:#C84A30;line-height:0.95;}
-.subtitle{font-family:'Anton',sans-serif;font-weight:400;text-transform:uppercase;letter-spacing:0.5px;font-size:24px;color:#C84A30;}
+.subtitle{font-family:'Anton',sans-serif;font-weight:400;text-transform:uppercase;letter-spacing:0.5px;font-size:24px;color:#1E4647;}
 .top-right{display:flex;align-items:flex-start;}
 .brand-logo{width:204px;height:167px;display:block;object-fit:contain;}
 .top-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;}
@@ -218,7 +219,7 @@ textarea.text-input{resize:vertical;font-family:var(--font-mono);font-size:12.5p
 <div id="print-report-container"></div>
 <script>
 const STORAGE_KEY = 'research-ledger-offline-v1';
-let state = { projects: [], steps: [], theme: 'light', settings: { staleDays: 14 } };
+let state = { projects: [], steps: [], theme: 'light', settings: { staleDays: 14, googleClientId: '', driveSyncEnabled: false } };
 const ui = { areaFilter: 'all', searchQuery: '', expanded: new Set(), showArchived: false, showCompletedTasks: false, showSomeday: false, nowRailCollapsed: false, summaryCollapsed: true };
 
 function escapeHtml(str){
@@ -314,14 +315,167 @@ async function loadState(){
 }
 function migrateState(){
   if (!state.theme) state.theme = 'light';
-  if (!state.settings) state.settings = { staleDays: 14 };
+  if (!state.settings) state.settings = { staleDays: 14, googleClientId: '', driveSyncEnabled: false };
   if (!state.settings.staleDays) state.settings.staleDays = 14;
+  if (state.settings.googleClientId === undefined) state.settings.googleClientId = '';
+  if (state.settings.driveSyncEnabled === undefined) state.settings.driveSyncEnabled = false;
   const today = new Date().toISOString().slice(0,10);
   state.steps.forEach(s => { if (!s.updated_at) s.updated_at = today; });
 }
 async function saveState(){
+  state.synced_at = new Date().toISOString();
   try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
   catch(e){ console.error('Save failed', e); }
+  driveWriteIfEnabled();
+}
+
+/* ---- Google Drive sync ---- */
+const DRIVE_FILE_NAME = 'golden-hour-data.json';
+const DRIVE_FILE_ID_KEY = 'golden-hour-drive-file-id';
+let driveToken = null;
+let driveTokenExpiry = 0;
+
+function driveTokenValid(){ return !!(driveToken && Date.now() < driveTokenExpiry - 60000); }
+
+function driveRequestToken(interactive){
+  return new Promise((resolve, reject) => {
+    if (!window.google?.accounts?.oauth2){ reject(new Error('Drive library not loaded yet')); return; }
+    if (!state.settings.googleClientId){ reject(new Error('No Client ID set')); return; }
+    const client = window.google.accounts.oauth2.initTokenClient({
+      client_id: state.settings.googleClientId,
+      scope: 'https://www.googleapis.com/auth/drive.file',
+      callback: (resp) => {
+        if (resp.error){ reject(new Error(resp.error)); return; }
+        driveToken = resp.access_token;
+        driveTokenExpiry = Date.now() + (parseInt(resp.expires_in, 10) * 1000);
+        resolve(driveToken);
+      },
+      error_callback: (err) => { reject(new Error(err?.type || 'token_error')); }
+    });
+    client.requestAccessToken({ prompt: interactive ? '' : 'none' });
+  });
+}
+
+async function driveEnsureToken(interactive){ return driveTokenValid() ? driveToken : driveRequestToken(interactive); }
+
+async function driveFindFile(){
+  const cached = localStorage.getItem(DRIVE_FILE_ID_KEY);
+  if (cached) return cached;
+  const q = encodeURIComponent(`name='${DRIVE_FILE_NAME}' and trashed=false`);
+  const resp = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id)&spaces=drive`,
+    { headers: { Authorization: `Bearer ${driveToken}` } });
+  const data = await resp.json();
+  if (data.files?.length){ localStorage.setItem(DRIVE_FILE_ID_KEY, data.files[0].id); return data.files[0].id; }
+  return null;
+}
+
+async function driveCreateFile(){
+  const meta = { name: DRIVE_FILE_NAME, mimeType: 'application/json' };
+  const form = new FormData();
+  form.append('metadata', new Blob([JSON.stringify(meta)], { type: 'application/json' }));
+  form.append('media', new Blob([JSON.stringify(state)], { type: 'application/json' }));
+  const resp = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',
+    { method: 'POST', headers: { Authorization: `Bearer ${driveToken}` }, body: form });
+  const data = await resp.json();
+  if (data.id) localStorage.setItem(DRIVE_FILE_ID_KEY, data.id);
+  return data.id;
+}
+
+async function driveReadState(){
+  const fileId = await driveFindFile();
+  if (!fileId) return null;
+  const resp = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+    { headers: { Authorization: `Bearer ${driveToken}` } });
+  if (!resp.ok){ localStorage.removeItem(DRIVE_FILE_ID_KEY); return null; }
+  return await resp.json();
+}
+
+async function driveWriteState(){
+  let fileId = await driveFindFile();
+  if (!fileId){ await driveCreateFile(); return; }
+  await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+    { method: 'PATCH', headers: { Authorization: `Bearer ${driveToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify(state) });
+}
+
+function driveWriteIfEnabled(){
+  if (!state.settings.driveSyncEnabled || !state.settings.googleClientId || !driveTokenValid()) return;
+  driveWriteState().catch(e => console.warn('Drive background write failed:', e));
+}
+
+function setDriveStatusEl(msg, isError){
+  const el = document.getElementById('drive-sync-status');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = isError ? 'var(--rust)' : 'var(--ink-soft)';
+}
+
+async function driveConnectAndSync(){
+  const clientId = document.getElementById('drive-client-id-input')?.value.trim();
+  if (clientId) state.settings.googleClientId = clientId;
+  setDriveStatusEl('Connecting to Google…');
+  try{
+    await driveEnsureToken(true);
+    state.settings.driveSyncEnabled = true;
+    await driveMergeAndSync();
+    openSettingsModal(); // refresh modal to show connected state
+  } catch(e){
+    setDriveStatusEl('Could not connect: ' + e.message, true);
+  }
+}
+
+async function driveSyncNow(){
+  setDriveStatusEl('Syncing…');
+  try{
+    await driveEnsureToken(true);
+    await driveMergeAndSync();
+    openSettingsModal();
+  } catch(e){
+    setDriveStatusEl('Sync failed: ' + e.message, true);
+  }
+}
+
+async function driveMergeAndSync(){
+  const remote = await driveReadState();
+  if (remote && Array.isArray(remote.projects) && Array.isArray(remote.steps)){
+    const localTime = state.synced_at || '';
+    const remoteTime = remote.synced_at || '';
+    if (remoteTime > localTime){
+      const clientId = state.settings.googleClientId;
+      state = remote;
+      state.settings.googleClientId = clientId; // keep local client ID
+      state.settings.driveSyncEnabled = true;
+      migrateState();
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      renderAll();
+      applyTheme();
+    }
+  }
+  state.synced_at = new Date().toISOString();
+  await driveWriteState();
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  const t = new Date(state.synced_at).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+  setDriveStatusEl('Synced at ' + t);
+}
+
+function driveDisconnect(){
+  state.settings.driveSyncEnabled = false;
+  state.settings.googleClientId = '';
+  driveToken = null;
+  driveTokenExpiry = 0;
+  localStorage.removeItem(DRIVE_FILE_ID_KEY);
+  saveState();
+  openSettingsModal();
+}
+
+async function driveTrySilentSync(){
+  if (!state.settings.driveSyncEnabled || !state.settings.googleClientId) return;
+  try{
+    await driveEnsureToken(false);
+    await driveMergeAndSync();
+  } catch(e){
+    // Silent failure — user can reconnect manually via Settings
+    console.warn('Silent Drive sync failed (token may need refresh):', e.message);
+  }
 }
 
 /* ---- shell ---- */
@@ -333,8 +487,8 @@ function renderShell(){
         <div class="subtitle">A better look at the day.</div>
         <div class="top-actions">
           <button data-action="open-add-project" class="btn-ghost">+ Project</button>
-          <button data-action="open-bulk-add" class="btn-ghost">Bulk add</button>
-          <button data-action="open-backup" class="btn-ghost">Backup</button>
+          <button data-action="open-settings" class="btn-ghost">Settings</button>
+          <button id="theme-toggle-btn" data-action="toggle-theme" class="btn-ghost">Dark mode</button>
         </div>
       </div>
       <div class="top-right">
@@ -398,8 +552,6 @@ Personal site redesign, creative, 3"></textarea>
         <button id="show-archived-btn" data-action="toggle-show-archived" class="btn-ghost-sm">Show archived</button>
         <button id="show-someday-btn" data-action="toggle-show-someday" class="btn-ghost-sm">Show someday</button>
         <button id="expand-all-btn" data-action="toggle-expand-all" class="btn-ghost-sm">Expand all</button>
-        <button id="theme-toggle-btn" data-action="toggle-theme" class="btn-ghost-sm">Dark mode</button>
-        <button data-action="open-settings" class="btn-ghost-sm">Settings</button>
         <input type="text" id="search-input" class="text-input search-input" placeholder="Search projects or tasks...">
       </div>
     </div>
@@ -1069,10 +1221,14 @@ function openBackupModal(){
 function closeModal(){ document.getElementById('modal-overlay').classList.add('hidden'); }
 
 function openSettingsModal(){
+  const connected = state.settings.driveSyncEnabled && state.settings.googleClientId;
+  const lastSync = state.synced_at
+    ? 'Last synced ' + new Date(state.synced_at).toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' })
+    : 'Never synced';
   document.getElementById('modal-content').innerHTML = `
     <h3>Settings</h3>
-    <p class="muted-sm">Tweak a few things to match how you work. More settings will land here over time.</p>
-    <div>
+    <p class="muted-sm">Tweak a few things to match how you work.</p>
+    <div style="margin-bottom:14px;">
       <label class="muted-sm" style="display:block;margin-bottom:4px;">Remind me about a task if it hasn't moved in (days)</label>
       <input type="number" class="text-input" id="settings-stale-days" min="1" step="1" value="${state.settings.staleDays}">
     </div>
@@ -1080,6 +1236,32 @@ function openSettingsModal(){
       <button class="btn-primary" data-action="save-settings">Save</button>
       <button class="btn-ghost" data-action="close-modal">Cancel</button>
     </div>
+    <hr style="border:none;border-top:1px solid var(--rule);margin:16px 0;">
+    <h4 style="margin:0 0 8px;font-size:14px;">Data</h4>
+    <div class="form-actions" style="margin-bottom:0;">
+      <button class="btn-ghost" data-action="open-bulk-add-from-settings">Bulk add projects</button>
+      <button class="btn-ghost" data-action="open-backup-from-settings">Backup &amp; restore</button>
+    </div>
+    <hr style="border:none;border-top:1px solid var(--rule);margin:16px 0;">
+    <h4 style="margin:0 0 6px;font-size:14px;">Google Drive sync</h4>
+    <p class="muted-sm" style="margin-bottom:12px;">Keep your data in sync across devices. Requires a free Google Cloud project — <a href="https://github.com/DanielSprockett/golden-hour#drive-sync-setup" target="_blank" rel="noopener noreferrer" style="color:var(--indigo);">see setup guide ↗</a></p>
+    ${connected ? `
+      <div class="muted-sm" style="margin-bottom:10px;">✓ Connected · ${lastSync}</div>
+      <div id="drive-sync-status" class="muted-sm" style="min-height:18px;margin-bottom:10px;"></div>
+      <div class="form-actions" style="margin-bottom:0;">
+        <button class="btn-ghost" data-action="drive-sync-now">Sync now</button>
+        <button class="btn-ghost danger" data-action="drive-disconnect">Disconnect</button>
+      </div>
+    ` : `
+      <div style="margin-bottom:10px;">
+        <label class="muted-sm" style="display:block;margin-bottom:4px;">Google OAuth Client ID</label>
+        <input type="text" class="text-input" id="drive-client-id-input" placeholder="paste your client ID here" value="${escapeHtml(state.settings.googleClientId || '')}">
+      </div>
+      <div id="drive-sync-status" class="muted-sm" style="min-height:18px;margin-bottom:10px;"></div>
+      <div class="form-actions" style="margin-bottom:0;">
+        <button class="btn-primary" data-action="drive-connect">Connect Drive</button>
+      </div>
+    `}
   `;
   document.getElementById('modal-overlay').classList.remove('hidden');
 }
@@ -1176,9 +1358,14 @@ function handleClick(e){
     case 'toggle-theme': toggleTheme(); break;
     case 'toggle-someday-project': toggleSomedayProject(id); break;
     case 'open-backup': openBackupModal(); break;
+    case 'open-backup-from-settings': closeModal(); openBackupModal(); break;
+    case 'open-bulk-add-from-settings': closeModal(); document.getElementById('bulk-add-panel').classList.remove('hidden'); document.getElementById('bulk-add-panel').scrollIntoView({behavior:'smooth'}); break;
     case 'close-modal': closeModal(); break;
     case 'open-settings': openSettingsModal(); break;
     case 'save-settings': saveSettings(); break;
+    case 'drive-connect': driveConnectAndSync(); break;
+    case 'drive-sync-now': driveSyncNow(); break;
+    case 'drive-disconnect': driveDisconnect(); break;
     case 'print-project-report': printProjectReport(id); break;
     case 'restore-backup': restoreBackup(); break;
     case 'reset-all': resetAll(); break;
@@ -1221,6 +1408,7 @@ async function init(){
   await loadState();
   applyTheme();
   renderAll();
+  driveTrySilentSync(); // non-blocking, best-effort
 }
 init();
 </script>
