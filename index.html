@@ -339,20 +339,27 @@ function driveTokenValid(){ return !!(driveToken && Date.now() < driveTokenExpir
 
 function driveRequestToken(interactive){
   return new Promise((resolve, reject) => {
-    if (!window.google?.accounts?.oauth2){ reject(new Error('Drive library not loaded yet')); return; }
     if (!state.settings.googleClientId){ reject(new Error('No Client ID set')); return; }
-    const client = window.google.accounts.oauth2.initTokenClient({
-      client_id: state.settings.googleClientId,
-      scope: 'https://www.googleapis.com/auth/drive.file',
-      callback: (resp) => {
-        if (resp.error){ reject(new Error(resp.error)); return; }
-        driveToken = resp.access_token;
-        driveTokenExpiry = Date.now() + (parseInt(resp.expires_in, 10) * 1000);
-        resolve(driveToken);
-      },
-      error_callback: (err) => { reject(new Error(err?.type || 'token_error')); }
-    });
-    client.requestAccessToken({ prompt: interactive ? '' : 'none' });
+    let attempts = 0;
+    const tryConnect = () => {
+      if (!window.google?.accounts?.oauth2){
+        if (++attempts < 50){ setTimeout(tryConnect, 100); return; } // wait up to 5s
+        reject(new Error('Google Sign-In did not load — check your internet connection and try again')); return;
+      }
+      const client = window.google.accounts.oauth2.initTokenClient({
+        client_id: state.settings.googleClientId,
+        scope: 'https://www.googleapis.com/auth/drive.file',
+        callback: (resp) => {
+          if (resp.error){ reject(new Error(resp.error)); return; }
+          driveToken = resp.access_token;
+          driveTokenExpiry = Date.now() + (parseInt(resp.expires_in, 10) * 1000);
+          resolve(driveToken);
+        },
+        error_callback: (err) => { reject(new Error(err?.type || 'token_error')); }
+      });
+      client.requestAccessToken({ prompt: interactive ? '' : 'none' });
+    };
+    tryConnect();
   });
 }
 
