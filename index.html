@@ -321,6 +321,7 @@ function migrateState(){
   if (state.settings.driveSyncEnabled === undefined) state.settings.driveSyncEnabled = false;
   const today = new Date().toISOString().slice(0,10);
   state.steps.forEach(s => { if (!s.updated_at) s.updated_at = today; });
+  state.projects.forEach(p => { if (!p.modified_at) p.modified_at = today; });
 }
 async function saveState(){
   state.synced_at = new Date().toISOString();
@@ -423,45 +424,70 @@ async function driveConnectAndSync(){
   try{
     await driveEnsureToken(true);
     state.settings.driveSyncEnabled = true;
-    await driveMergeAndSync();
-    openSettingsModal(); // refresh modal to show connected state
+    // On first connect: pull if Drive has more data, otherwise push local data up
+    await drivePullAndMerge();
+    await drivePush();
+    openSettingsModal();
   } catch(e){
     setDriveStatusEl('Could not connect: ' + e.message, true);
   }
 }
 
-async function driveSyncNow(){
-  setDriveStatusEl('Syncing…');
-  try{
-    await driveEnsureToken(true);
-    await driveMergeAndSync();
-    openSettingsModal();
-  } catch(e){
-    setDriveStatusEl('Sync failed: ' + e.message, true);
-  }
-}
-
-async function driveMergeAndSync(){
-  const remote = await driveReadState();
-  if (remote && Array.isArray(remote.projects) && Array.isArray(remote.steps)){
-    const localTime = state.synced_at || '';
-    const remoteTime = remote.synced_at || '';
-    if (remoteTime > localTime){
-      const clientId = state.settings.googleClientId;
-      state = remote;
-      state.settings.googleClientId = clientId; // keep local client ID
-      state.settings.driveSyncEnabled = true;
-      migrateState();
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      renderAll();
-      applyTheme();
-    }
-  }
+// Push local state to Drive — always overwrites Drive with current local data
+async function drivePush(){
   state.synced_at = new Date().toISOString();
   await driveWriteState();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   const t = new Date(state.synced_at).toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
-  setDriveStatusEl('Synced at ' + t);
+  setDriveStatusEl('Pushed to Drive at ' + t);
+}
+
+// Pull from Drive only if it has meaningfully more data than local (used on first connect / page load)
+function mergeStates(local, remote){
+  // Union of all projects by ID — prefer whichever was modified more recently
+  const projMap = new Map();
+  local.projects.forEach(p => projMap.set(p.id, p));
+  remote.projects.forEach(p => {
+    const existing = projMap.get(p.id);
+    if (!existing || (p.modified_at || '') > (existing.modified_at || '')) projMap.set(p.id, p);
+  });
+  // Union of all steps by ID — prefer whichever was updated more recently
+  const stepMap = new Map();
+  local.steps.forEach(s => stepMap.set(s.id, s));
+  remote.steps.forEach(s => {
+    const existing = stepMap.get(s.id);
+    if (!existing || (s.updated_at || '') > (existing.updated_at || '')) stepMap.set(s.id, s);
+  });
+  return {
+    projects: Array.from(projMap.values()),
+    steps: Array.from(stepMap.values()),
+  };
+}
+
+async function drivePullAndMerge(){
+  const remote = await driveReadState();
+  if (!remote || !Array.isArray(remote.projects) || !Array.isArray(remote.steps)) return;
+  const merged = mergeStates(state, remote);
+  const clientId = state.settings.googleClientId;
+  state.projects = merged.projects;
+  state.steps = merged.steps;
+  state.settings.googleClientId = clientId;
+  state.settings.driveSyncEnabled = true;
+  migrateState();
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  renderAll();
+  applyTheme();
+}
+
+async function driveSyncNow(){
+  setDriveStatusEl('Pushing to Drive…');
+  try{
+    await driveEnsureToken(true);
+    await drivePush();
+    openSettingsModal();
+  } catch(e){
+    setDriveStatusEl('Sync failed: ' + e.message, true);
+  }
 }
 
 function driveDisconnect(){
@@ -478,9 +504,10 @@ async function driveTrySilentSync(){
   if (!state.settings.driveSyncEnabled || !state.settings.googleClientId) return;
   try{
     await driveEnsureToken(false);
-    await driveMergeAndSync();
+    // On page load: pull if Drive has more data, then push our current state
+    await drivePullAndMerge();
+    await drivePush();
   } catch(e){
-    // Silent failure — user can reconnect manually via Settings
     console.warn('Silent Drive sync failed (token may need refresh):', e.message);
   }
 }
@@ -805,6 +832,7 @@ function toggleArchiveProject(id){
   const p = state.projects.find(pr=>pr.id===id);
   if (!p) return;
   p.archived = !p.archived;
+  p.modified_at = new Date().toISOString();
   saveState();
   renderAll();
 }
@@ -813,6 +841,7 @@ function toggleSomedayProject(id){
   const p = state.projects.find(pr=>pr.id===id);
   if (!p) return;
   p.someday = !p.someday;
+  p.modified_at = new Date().toISOString();
   saveState();
   renderAll();
 }
@@ -1059,7 +1088,7 @@ function saveNewProject(){
   const priority = priorityRaw === '' ? '' : priorityRaw;
   const docLink = document.getElementById('new-project-doclink').value.trim();
   const notes = document.getElementById('new-project-notes').value.trim();
-  state.projects.push({ id: uid('proj'), name, area, priority, doc_link: docLink, notes });
+  state.projects.push({ id: uid('proj'), name, area, priority, doc_link: docLink, notes, modified_at: new Date().toISOString() });
   saveState();
   document.getElementById('new-project-name').value = '';
   document.getElementById('new-project-priority').value = '';
@@ -1140,6 +1169,7 @@ function saveProjectEdit(id){
   p.priority = container.querySelector('.proj-edit-priority').value.trim();
   p.doc_link = container.querySelector('.proj-edit-doclink').value.trim();
   p.notes = container.querySelector('.proj-edit-notes').value.trim();
+  p.modified_at = new Date().toISOString();
   saveState();
   renderAll();
 }
