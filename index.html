@@ -480,10 +480,11 @@ async function drivePullAndMerge(){
 }
 
 async function driveSyncNow(){
-  setDriveStatusEl('Pushing to Drive…');
+  setDriveStatusEl('Merging with Drive…');
   try{
     await driveEnsureToken(true);
-    await drivePush();
+    await drivePullAndMerge(); // pick up any changes from other devices
+    await drivePush();         // push the combined result back
     openSettingsModal();
   } catch(e){
     setDriveStatusEl('Sync failed: ' + e.message, true);
@@ -504,9 +505,14 @@ async function driveTrySilentSync(){
   if (!state.settings.driveSyncEnabled || !state.settings.googleClientId) return;
   try{
     await driveEnsureToken(false);
-    // On page load: pull if Drive has more data, then push our current state
-    await drivePullAndMerge();
-    await drivePush();
+    if (state.projects.length === 0){
+      // Fresh device with no local data — pull from Drive
+      await drivePullAndMerge();
+      if (state.projects.length > 0) await drivePush();
+    } else {
+      // Has local data — just push quietly, NEVER auto-pull over existing data
+      await drivePush();
+    }
   } catch(e){
     console.warn('Silent Drive sync failed (token may need refresh):', e.message);
   }
